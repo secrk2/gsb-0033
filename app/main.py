@@ -31,8 +31,8 @@ app.include_router(admin_router.router)
 def startup() -> None:
     init_db()
     seed_if_empty()
-    # 预热审计索引
-    query("SELECT scope FROM config_audit_logs LIMIT 1")
+    # 预热审计索引（config_audit_logs 没有 scope 列，按实际存在的索引列预热）
+    query("SELECT created_at FROM config_audit_logs LIMIT 1")
 
 
 # ---------------------------------------------------------------- 基础工具

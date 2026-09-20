@@ -216,7 +216,29 @@ def init_db() -> None:
     conn = get_conn()
     conn.executescript(SCHEMA)
     _migrate_legacy(conn)
+    _repair_audit_environment(conn)
     conn.commit()
+
+
+def _repair_audit_environment(conn) -> None:
+    """修复历史脏数据：逐键改动流水必须与所属版本的环境一致。
+
+    旧版保存逻辑在出现非 global（集群/灰度）键时，会把整批流水错挂到
+    “应用所属环境”，导致预发等环境的改动串进生产留痕并绕过按环境的可见范围。
+    这里以 config_versions.environment 为权威来源回填纠正；
+    reveal 流水 version_id 为 NULL 且本就按实际环境记录，不在修复范围内。
+    """
+    conn.execute(
+        """UPDATE config_audit_logs
+           SET environment = (
+               SELECT v.environment FROM config_versions v
+               WHERE v.id = config_audit_logs.version_id)
+           WHERE version_id IS NOT NULL
+             AND action IN ('add','update','remove','rollback')
+             AND environment <> (
+               SELECT v.environment FROM config_versions v
+               WHERE v.id = config_audit_logs.version_id)"""
+    )
 
 
 def _migrate_legacy(conn) -> None:

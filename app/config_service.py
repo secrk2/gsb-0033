@@ -299,18 +299,15 @@ def save_profile(app_id: int, environment: str, items: list[dict], user: dict,
             [(app_id, environment, it["key"], it["value"], it["value_type"],
               it["scope"], it["is_secret"], user["id"], now) for it in items],
         )
-        # 生效范围非 global 的键，其变更留痕按应用登记环境归档
-        audit_env = environment
-        if any(it.get("scope") != "global" for it in items):
-            ar = conn.execute("SELECT environment FROM applications WHERE id = ?",
-                              (app_id,)).fetchone()
-            audit_env = ar["environment"] if ar else environment
+        # 留痕按"本次保存的配置环境"归档：配置项挂在 (应用, 环境) 上，
+        # 与键的生效范围（global/cluster/canary）无关。
+        # 改挂应用所属环境会把预发等环境的改动串到生产，并绕过按环境的可见范围校验。
         conn.executemany(
             """INSERT INTO config_audit_logs
                (app_id, environment, version_id, user_id, action, config_key,
                 old_value, new_value, is_secret, reason, created_at)
                VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
-            [(app_id, audit_env, version_id, user["id"], action, key,
+            [(app_id, environment, version_id, user["id"], action, key,
               old_v, new_v, is_secret, reason, now)
              for action, key, old_v, new_v, is_secret, reason in audit_rows],
         )
@@ -386,36 +383,11 @@ def summarize_diff(entries: list[dict]) -> dict:
     }
 
 
-def _previous_snapshot(app_id: int, environment: str) -> list[dict]:
-    """上一版快照：按版本号取倒数第二个版本。"""
-    rows = query(
-        "SELECT snapshot FROM config_versions WHERE app_id = ? AND environment = ?"
-        " ORDER BY version DESC LIMIT 2",
-        (app_id, environment),
-    )
-    if len(rows) < 2:
-        return []
-    try:
-        return json.loads(rows[1]["snapshot"])
-    except (TypeError, ValueError):
-        return []
-
-
-def _apply_secret_baseline(rows: list[dict], snapshot: list[dict]) -> None:
-    """密文键在对比视图里沿用上一版快照的值——对比不展示最新密文，避免泄漏。"""
-    if not snapshot:
-        return
-    base = {it.get("key"): it for it in snapshot if isinstance(it, dict)}
-    for row in rows:
-        if bool(row.get("is_secret")) and row.get("key") in base:
-            row["value"] = base[row["key"]].get("value", row["value"])
-
-
 def diff_environments(app_id: int, env_a: str, env_b: str) -> dict:
+    # 值一律按库里的真实当前值比较（密文是否轮换由此准确判定），
+    # 两侧展示值在 _side 内脱敏：密文差异只提示不同，绝不泄漏明文。
     a_rows = current_items(app_id, env_a)
     b_rows = current_items(app_id, env_b)
-    _apply_secret_baseline(a_rows, _previous_snapshot(app_id, env_a))
-    _apply_secret_baseline(b_rows, _previous_snapshot(app_id, env_b))
     entries = diff_item_lists(a_rows, b_rows)
     return {"env_a": env_a, "env_b": env_b, "entries": entries,
             "summary": summarize_diff(entries)}
@@ -600,13 +572,17 @@ CSV_HEADER = ["时间", "业务线", "应用", "环境", "操作人", "动作", 
 def export_csv(rows) -> str:
     buf = io.StringIO()
     buf.write("﻿")  # UTF-8 BOM，Excel 直接打开不乱码
-    buf.write(",".join(CSV_HEADER) + "\n")
+    # 用标准 csv 写出：值里出现逗号 / 等号 / 引号 / 换行时自动加引号转义，
+    # 不能手工 join(",")，否则 "key=value,key=value" 会被拆到多列、变更单无法使用。
+    writer = csv.writer(buf, lineterminator="\n")
+    writer.writerow(CSV_HEADER)
     for r in rows:
         d = audit_row_to_dict(r)
-        # 导出是拿去做变更单的，密文列直接落原始内容，方便比对
-        old_v = "" if r["old_value"] is None else r["old_value"]
-        new_v = "" if r["new_value"] is None else r["new_value"]
-        cells = [
+        # 导出去做变更单：密文与页面/留痕一致一律脱敏，绝不把明文落进导出文件；
+        # 是否密文已有独立列标识，不影响比对键值是否发生变化。
+        old_v = "" if d["old_value"] is None else d["old_value"]
+        new_v = "" if d["new_value"] is None else d["new_value"]
+        writer.writerow([
             time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(d["created_at"])),
             d["business_line_name"],
             d["app_name"],
@@ -618,6 +594,5 @@ def export_csv(rows) -> str:
             new_v,
             "是" if d["is_secret"] else "否",
             d["reason"],
-        ]
-        buf.write(",".join("" if c is None else str(c) for c in cells) + "\n")
+        ])
     return buf.getvalue()
