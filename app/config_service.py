@@ -299,18 +299,14 @@ def save_profile(app_id: int, environment: str, items: list[dict], user: dict,
             [(app_id, environment, it["key"], it["value"], it["value_type"],
               it["scope"], it["is_secret"], user["id"], now) for it in items],
         )
-        # 生效范围非 global 的键，其变更留痕按应用登记环境归档
-        audit_env = environment
-        if any(it.get("scope") != "global" for it in items):
-            ar = conn.execute("SELECT environment FROM applications WHERE id = ?",
-                              (app_id,)).fetchone()
-            audit_env = ar["environment"] if ar else environment
+        # 留痕按实际发生变更的配置环境归档：键的生效范围（scope）只描述键作用于
+        # 哪个集群/灰度，不改变这次变更所属的环境，绝不能改挂到应用登记环境名下。
         conn.executemany(
             """INSERT INTO config_audit_logs
                (app_id, environment, version_id, user_id, action, config_key,
                 old_value, new_value, is_secret, reason, created_at)
                VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
-            [(app_id, audit_env, version_id, user["id"], action, key,
+            [(app_id, environment, version_id, user["id"], action, key,
               old_v, new_v, is_secret, reason, now)
              for action, key, old_v, new_v, is_secret, reason in audit_rows],
         )
@@ -386,36 +382,11 @@ def summarize_diff(entries: list[dict]) -> dict:
     }
 
 
-def _previous_snapshot(app_id: int, environment: str) -> list[dict]:
-    """上一版快照：按版本号取倒数第二个版本。"""
-    rows = query(
-        "SELECT snapshot FROM config_versions WHERE app_id = ? AND environment = ?"
-        " ORDER BY version DESC LIMIT 2",
-        (app_id, environment),
-    )
-    if len(rows) < 2:
-        return []
-    try:
-        return json.loads(rows[1]["snapshot"])
-    except (TypeError, ValueError):
-        return []
-
-
-def _apply_secret_baseline(rows: list[dict], snapshot: list[dict]) -> None:
-    """密文键在对比视图里沿用上一版快照的值——对比不展示最新密文，避免泄漏。"""
-    if not snapshot:
-        return
-    base = {it.get("key"): it for it in snapshot if isinstance(it, dict)}
-    for row in rows:
-        if bool(row.get("is_secret")) and row.get("key") in base:
-            row["value"] = base[row["key"]].get("value", row["value"])
-
-
 def diff_environments(app_id: int, env_a: str, env_b: str) -> dict:
+    # 按两侧当前真实值比较；密文只在输出层脱敏（_side），不参与取值替换，
+    # 否则密文改值后对比结果会停留在改动前的旧状态。
     a_rows = current_items(app_id, env_a)
     b_rows = current_items(app_id, env_b)
-    _apply_secret_baseline(a_rows, _previous_snapshot(app_id, env_a))
-    _apply_secret_baseline(b_rows, _previous_snapshot(app_id, env_b))
     entries = diff_item_lists(a_rows, b_rows)
     return {"env_a": env_a, "env_b": env_b, "entries": entries,
             "summary": summarize_diff(entries)}
@@ -600,13 +571,13 @@ CSV_HEADER = ["时间", "业务线", "应用", "环境", "操作人", "动作", 
 def export_csv(rows) -> str:
     buf = io.StringIO()
     buf.write("﻿")  # UTF-8 BOM，Excel 直接打开不乱码
-    buf.write(",".join(CSV_HEADER) + "\n")
+    writer = csv.writer(buf, lineterminator="\n")
+    writer.writerow(CSV_HEADER)
     for r in rows:
         d = audit_row_to_dict(r)
-        # 导出是拿去做变更单的，密文列直接落原始内容，方便比对
-        old_v = "" if r["old_value"] is None else r["old_value"]
-        new_v = "" if r["new_value"] is None else r["new_value"]
-        cells = [
+        # 密文与其他接口一致只落脱敏形态（••••••••），明文不出现在导出文件里；
+        # 值里含逗号/引号/换行由 csv 模块转义，保证列不错位、可直接做变更单。
+        writer.writerow([
             time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(d["created_at"])),
             d["business_line_name"],
             d["app_name"],
@@ -614,10 +585,9 @@ def export_csv(rows) -> str:
             d["user_name"],
             d["action_label"],
             d["config_key"],
-            old_v,
-            new_v,
+            "" if d["old_value"] is None else d["old_value"],
+            "" if d["new_value"] is None else d["new_value"],
             "是" if d["is_secret"] else "否",
             d["reason"],
-        ]
-        buf.write(",".join("" if c is None else str(c) for c in cells) + "\n")
+        ])
     return buf.getvalue()
